@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Organize ~/Pictures/screenshot-*.png into an indexed folder.
-Uses the dayflow OpenRouter config and vision model (default gemma-4-31b-it)
-to caption/rename screenshots one image per request, then writes index.md.
+Captions each shot with an OpenRouter vision model (default gemma-4-31b-it),
+one image per request, renames it, then rebuilds index.md.
 """
 import base64
 import json
@@ -15,7 +15,10 @@ from pathlib import Path
 from PIL import Image
 import requests
 
-CONFIG = Path.home() / ".config" / "dayflow" / "config.json"
+# Own config first; dayflow's config is kept as a legacy fallback so installs
+# that only ever configured dayflow keep working unchanged.
+CONFIG = Path.home() / ".config" / "snapdex" / "config.json"
+LEGACY_CONFIG = Path.home() / ".config" / "dayflow" / "config.json"
 SRC_DIR = Path.home() / "Pictures"
 DST_DIR = Path.home() / "Pictures" / "Screenshots"
 PROMPT = (
@@ -27,9 +30,13 @@ PROMPT = (
 
 
 def load_config():
-    if not CONFIG.exists():
-        raise SystemExit("No dayflow config found at " + str(CONFIG))
-    cfg = json.loads(CONFIG.read_text())
+    cfg = {}
+    for path in (LEGACY_CONFIG, CONFIG):  # later wins: own config overrides
+        if path.exists():
+            cfg.update(json.loads(path.read_text()))
+    if not cfg:
+        raise SystemExit(
+            "No config found at %s (or legacy %s)" % (CONFIG, LEGACY_CONFIG))
     key = cfg.get("openrouter_api_key") or os.environ.get("OPENROUTER_API_KEY")
     if not key:
         raise SystemExit("No OpenRouter API key found")
@@ -64,8 +71,8 @@ def caption_one(api_key, model, path, attempts=3):
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
-                    "HTTP-Referer": "https://dayflow.sh",
-                    "X-Title": "dayflow-screenshots",
+                    "HTTP-Referer": "https://github.com/duketopceo/snapdex",
+                    "X-Title": "snapdex",
                 },
                 json={
                     "model": model,

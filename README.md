@@ -1,4 +1,6 @@
-# snapdex
+<p align="center"><img src="assets/brand/wordmark.svg" alt="snapdex" height="64"></p>
+
+> Logo is a proposal pending owner sign-off.
 
 Auto-rename and index screenshots with a vision model.
 
@@ -74,3 +76,11 @@ OpenRouter for captioning. The renamed files and index stay local in
 `~/Pictures/Screenshots/`.
 
 MIT licensed.
+
+## Status and roadmap
+
+See [ROADMAP.md](ROADMAP.md), [DESIGN.md](DESIGN.md) and [docs/research/2026-10-10-landscape.md](docs/research/2026-10-10-landscape.md). No tests or CI yet.
+
+## Contributing
+
+Issues and PRs welcome; keep the script a single dependency-light file.

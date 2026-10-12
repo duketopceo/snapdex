@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="snapdex">
+  <title>snapdex mark (proposal)</title>
+  <!-- four crop corners = the capture -->
+  <g fill="none" stroke="#1B1F23" stroke-width="6" stroke-linecap="square">
+    <path d="M6 22V6h16"/><path d="M42 6h16v16"/><path d="M58 42v16H42"/><path d="M22 58H6V42"/>
+  </g>
+  <!-- caption bar = the index line -->
+  <rect x="18" y="28" width="28" height="8" fill="#C2410C"/>
+</svg>

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plugin controller: one JSON object per call, for Panel.qml.
 
-  snapdex-ctl status            pending count, auto state, last run
+  snapdex-ctl status            inbox, library, pending (inbox), indexed, auto, last run
   snapdex-ctl panel [query]     status + recent 12 (or search hits)
   snapdex-ctl process           run snapdex over everything pending
   snapdex-ctl auto on|off       install+enable / disable the path unit
@@ -39,13 +39,30 @@ def _systemctl(*args):
         return 1, str(e)
 
 
+CONFIGS = (Path.home() / ".config" / "dayflow" / "config.json",
+           Path.home() / ".config" / "snapdex" / "config.json")
+
+
+def library():
+    return lib.library_dir(config_paths=CONFIGS)
+
+
+def indexed_rows(libdir):
+    try:
+        rows = lib.parse_index((libdir / "index.md").read_text())
+    except OSError:
+        return []
+    return [r for r in rows if (libdir / r["rel"]).exists()]
+
+
 def status():
-    sources, dst = lib.screenshot_dirs()
+    sources, inbox = lib.screenshot_dirs()
+    libdir = library()
     pending = lib.list_pending(sources)
     since_file = STATE / "auto_since"
     rc_en, en = _systemctl("is-enabled", UNIT)
     rc_ac, ac = _systemctl("is-active", UNIT)
-    index = dst / "index.md"
+    index = libdir / "index.md"
     try:
         last = index.stat().st_mtime
     except OSError:
@@ -53,7 +70,9 @@ def status():
     return {
         "ok": True,
         "pending": len(pending),
-        "dst": str(dst),
+        "inbox": str(inbox),
+        "library": str(libdir),
+        "indexed": len(indexed_rows(libdir)),
         "sources": [str(s) for s in sources],
         "auto": {"enabled": rc_en == 0 and since_file.exists(),
                  "installed": en not in ("", "not-found"),
@@ -64,16 +83,11 @@ def status():
 
 def panel(query=""):
     out = status()
-    _, dst = lib.screenshot_dirs()
-    try:
-        rows = lib.parse_index((dst / "index.md").read_text())
-    except OSError:
-        rows = []
-    rows = [r for r in rows if (dst / r["name"]).exists()]
+    libdir = library()
+    rows = indexed_rows(libdir)
     hits = lib.search(rows, query, 50) if query.strip() else lib.recent(rows, 12)
     out["query"] = query
-    out["indexed"] = len(rows)
-    out["items"] = [dict(r, path=str(dst / r["name"])) for r in hits]
+    out["items"] = [dict(r, path=str(libdir / r["rel"])) for r in hits]
     return out
 
 

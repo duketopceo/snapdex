@@ -9,13 +9,19 @@ one image per request, renames it, then rebuilds index.md.
                      only shots taken after auto-processing was enabled,
                      leaves a shot untouched when captioning fails
   snapdex --dry-run  list what would be processed, no network, no moves
+  snapdex migrate [--dry-run]   move already-captioned shots from the inbox
+                     into Library/YYYY/MM and rewrite the index
+  snapdex migrate --undo <tsv>  reverse a migrate using its manifest
+
+Inbox: where Omarchy saves raw shots. Library: <inbox>/Library by default
+(config key "library" or env SNAPDEX_LIBRARY); captioned shots move to
+Library/YYYY/MM/ and leave the inbox.
 """
 import argparse
 import base64
 import fcntl
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -125,14 +131,46 @@ def read_auto_since():
         return None
 
 
+def library_root():
+    return lib.library_dir(config_paths=(LEGACY_CONFIG, CONFIG))
+
+
+def migrate_main(argv):
+    ap = argparse.ArgumentParser(prog="snapdex migrate")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--undo", metavar="TSV")
+    args = ap.parse_args(argv)
+    _, inbox = lib.screenshot_dirs()
+    library = library_root()
+    if args.undo:
+        restored, skipped = lib.undo_migrate(args.undo, library)
+        print(f"Restored {restored}, skipped {skipped}. Index rewritten.")
+        return 0
+    moves, manifest = lib.migrate(inbox, library, dry_run=args.dry_run)
+    pngs = sum(1 for o, _ in moves if o.suffix == ".png")
+    if args.dry_run:
+        for old, new in moves[:5]:
+            print(f"  {old.name} -> {new.relative_to(library)}")
+        print(f"dry run: {pngs} file(s) would move from {inbox} to {library}"
+              f" ({len(moves) - pngs} extra: old index.md)")
+        return 0
+    print(f"Moved {pngs} file(s) to {library}; manifest {manifest}")
+    print(f"Undo: snapdex migrate --undo {manifest}")
+    return 0
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "migrate":
+        return migrate_main(argv[1:])
     ap = argparse.ArgumentParser(prog="snapdex")
     ap.add_argument("--auto", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--max", type=int, default=None, help="cap images this run")
     args = ap.parse_args(argv)
 
-    sources, dst_dir = lib.screenshot_dirs()
+    sources, _ = lib.screenshot_dirs()
+    dst_dir = library_root()
     STATE.mkdir(parents=True, exist_ok=True)
     lock = open(STATE / "run.lock", "w")
     try:
@@ -184,8 +222,8 @@ def main(argv=None):
             continue
         fails = 0
         ts = lib.parse_raw(f.name)[0]
-        dst = lib.unique_target(dst_dir, ts, caption)
-        shutil.move(str(f), str(dst))
+        dst = lib.unique_target(dst_dir, ts, caption, f.suffix.lower())
+        dst = lib.safe_move(f, dst)
         done += 1
         print(f"  {f.name} -> {dst.name}")
 

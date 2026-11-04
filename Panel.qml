@@ -5,8 +5,9 @@ import Quickshell.Io
 import qs.Commons as Commons
 import qs.Ui
 
-// Snapdex: camera glyph + badge (unprocessed screenshots) and a panel with
-// the last 12 captioned screenshots, caption search, "Process now" and the
+// Snapdex: camera glyph + badge (inbox count only: unprocessed screenshots)
+// and a panel with the last 12 captioned screenshots read from the Library
+// (snapdex-ctl returns each item's absolute path), caption search, "Process now" and the
 // auto-processing toggle. All state and work lives in bin/snapdex-ctl; the
 // systemd user path unit does the real watching, so this only shows status.
 //

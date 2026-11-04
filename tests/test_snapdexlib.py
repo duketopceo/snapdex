@@ -27,7 +27,6 @@ class Names(unittest.TestCase):
 
     def test_raw_rejects_processed_and_other(self):
         self.assertIsNone(lib.parse_raw("2026-11-03_14-40-44_foo.png"))
-        self.assertIsNone(lib.parse_raw("screenshot-2026-09-19_14-52-15-low.jpg"))
         self.assertIsNone(lib.parse_raw("test-panel.png"))
 
     def test_indexed(self):
@@ -47,11 +46,98 @@ class Names(unittest.TestCase):
         self.assertEqual(lib.sanitize("???"), "screenshot")
         self.assertLessEqual(len(lib.sanitize("a" * 100)), 40)
 
-    def test_unique_target(self):
+    def test_unique_target_suffix(self):
         with tempfile.TemporaryDirectory() as d:
-            (Path(d) / "2026-01-01_00-00-00_x.png").touch()
-            t = lib.unique_target(d, "2026-01-01_00-00-00", "x")
-            self.assertEqual(t.name, "2026-01-01_00-00-00_x_2.png")
+            ts = "2026-01-01_00-00-00"
+            t1 = lib.unique_target(d, ts, "x")
+            self.assertEqual(t1, Path(d) / "2026" / "01" / f"{ts}_x.png")
+            t1.parent.mkdir(parents=True)
+            t1.touch()
+            t2 = lib.unique_target(d, ts, "x")
+            self.assertEqual(t2.name, f"{ts}_x-2.png")
+            t2.touch()
+            self.assertEqual(lib.unique_target(d, ts, "x").name, f"{ts}_x-3.png")
+
+    def test_safe_move_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "a.png").write_text("new")
+            (d / "lib").mkdir()
+            (d / "lib" / "b.png").write_text("old")
+            final = lib.safe_move(d / "a.png", d / "lib" / "b.png")
+            self.assertEqual(final.name, "b-2.png")
+            self.assertEqual((d / "lib" / "b.png").read_text(), "old")
+            self.assertEqual(final.read_text(), "new")
+            self.assertFalse((d / "a.png").exists())
+
+    def test_library_path(self):
+        p = lib.library_path("/L", "2026-10-07_16-48-46", "slack_chat")
+        self.assertEqual(p, Path("/L/2026/10/2026-10-07_16-48-46_slack_chat.png"))
+
+    def test_library_dir_precedence(self):
+        with tempfile.TemporaryDirectory() as h:
+            self.assertEqual(lib.library_dir(env={}, home=h),
+                             Path(h) / "Pictures" / "Screenshots" / "Library")
+            cfg = Path(h) / "c.json"
+            cfg.write_text('{"library": "/cfg/lib", "openrouter_api_key": "x"}')
+            self.assertEqual(lib.library_dir(env={}, home=h, config_paths=[cfg]),
+                             Path("/cfg/lib"))
+            self.assertEqual(lib.library_dir(env={"SNAPDEX_LIBRARY": "/env/lib"},
+                                             home=h, config_paths=[cfg]),
+                             Path("/env/lib"))
+
+    def test_jpg_accepted(self):
+        self.assertEqual(lib.parse_raw("screenshot-2026-09-19_14-52-15-low.jpg"),
+                         ("2026-09-19_14-52-15", "low"))
+        self.assertIsNotNone(lib.parse_raw("screenshot-2026-09-19_14-52-15.jpeg"))
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "screenshot-2026-09-19_14-52-15-low.jpg").touch()
+            self.assertEqual([p.name for p in lib.list_pending([d])],
+                             ["screenshot-2026-09-19_14-52-15-low.jpg"])
+
+
+class Migrate(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.inbox = Path(self._td.name)
+        self.library = self.inbox / "Library"
+        for n in ("2026-10-07_16-48-46_slack_chat.png",
+                  "2026-11-01_00-00-00_foo.png"):
+            (self.inbox / n).write_text(n)
+        (self.inbox / "screenshot-2026-11-04_00-47-31-raw.png").touch()
+        (self.inbox / "notes.png").touch()
+        (self.inbox / "index.md").write_text("old")
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_dry_run_changes_nothing(self):
+        moves, manifest = lib.migrate(self.inbox, self.library, dry_run=True)
+        self.assertIsNone(manifest)
+        self.assertEqual(len([m for m in moves if m[0].suffix == ".png"]), 2)
+        self.assertTrue((self.inbox / "2026-10-07_16-48-46_slack_chat.png").exists())
+        self.assertFalse(self.library.exists())
+
+    def test_migrate_moves_and_indexes(self):
+        moves, manifest = lib.migrate(self.inbox, self.library)
+        self.assertTrue((self.library / "2026/10/2026-10-07_16-48-46_slack_chat.png").exists())
+        self.assertTrue((self.inbox / "screenshot-2026-11-04_00-47-31-raw.png").exists())
+        self.assertTrue((self.inbox / "notes.png").exists())
+        self.assertEqual(len(manifest.read_text().splitlines()), len(moves))
+        rows = lib.parse_index((self.library / "index.md").read_text())
+        self.assertEqual(len(rows), 2)
+        for r in rows:
+            self.assertTrue((self.library / r["rel"]).is_file())
+
+    def test_undo_restores(self):
+        _, manifest = lib.migrate(self.inbox, self.library)
+        restored, skipped = lib.undo_migrate(manifest, self.library)
+        self.assertEqual((restored, skipped), (3, 0))
+        self.assertEqual((self.inbox / "2026-11-01_00-00-00_foo.png").read_text(),
+                         "2026-11-01_00-00-00_foo.png")
+        self.assertEqual((self.inbox / "index.md").read_text(), "old")
+        self.assertEqual(lib.parse_index((self.library / "index.md").read_text()), [])
 
 
 class Dirs(unittest.TestCase):
@@ -128,15 +214,17 @@ class IndexAndSearch(unittest.TestCase):
     def test_build_index_roundtrip_skips_raw(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
-            (d / "2026-10-07_16-48-46_slack_chat.png").touch()
+            (d / "2026" / "10").mkdir(parents=True)
+            (d / "2026/10/2026-10-07_16-48-46_slack_chat.png").touch()
             (d / "screenshot-2026-11-04_00-47-31-herdr-app.png").touch()
             rows = lib.parse_index(lib.build_index(d))
             self.assertEqual([r["caption"] for r in rows], ["slack chat"])
+            self.assertEqual(rows[0]["rel"], "2026/10/2026-10-07_16-48-46_slack_chat.png")
 
     def test_index_written_only_on_change(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
-            (d / "2026-10-07_16-48-46_a.png").touch()
+            (d / "2026-10-07_16-48-46_a.png").touch()  # found via rglob
             self.assertTrue(lib.write_index_if_changed(d)[1])
             self.assertFalse(lib.write_index_if_changed(d)[1])
 

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Plugin controller: one JSON object per call, for Panel.qml.
+
+  snapdex-ctl status            pending count, auto state, last run
+  snapdex-ctl panel [query]     status + recent 12 (or search hits)
+  snapdex-ctl process           run snapdex over everything pending
+  snapdex-ctl auto on|off       install+enable / disable the path unit
+"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import snapdexlib as lib  # noqa: E402
+
+ROOT = HERE.parent
+STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "snapdex"
+UNIT = "snapdex.path"
+
+
+def _env():
+    env = dict(os.environ)
+    rt = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    env["XDG_RUNTIME_DIR"] = rt
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={rt}/bus")
+    env["PATH"] = "/usr/local/bin:/usr/bin:/bin:" + str(Path.home() / ".local/bin")
+    return env
+
+
+def _systemctl(*args):
+    try:
+        r = subprocess.run(["systemctl", "--user", *args], capture_output=True,
+                           text=True, timeout=10, env=_env())
+        return r.returncode, r.stdout.strip()
+    except Exception as e:
+        return 1, str(e)
+
+
+def status():
+    sources, dst = lib.screenshot_dirs()
+    pending = lib.list_pending(sources)
+    since_file = STATE / "auto_since"
+    rc_en, en = _systemctl("is-enabled", UNIT)
+    rc_ac, ac = _systemctl("is-active", UNIT)
+    index = dst / "index.md"
+    try:
+        last = index.stat().st_mtime
+    except OSError:
+        last = None
+    return {
+        "ok": True,
+        "pending": len(pending),
+        "dst": str(dst),
+        "sources": [str(s) for s in sources],
+        "auto": {"enabled": rc_en == 0 and since_file.exists(),
+                 "installed": en not in ("", "not-found"),
+                 "active": ac == "active"},
+        "last_run": last,
+    }
+
+
+def panel(query=""):
+    out = status()
+    _, dst = lib.screenshot_dirs()
+    try:
+        rows = lib.parse_index((dst / "index.md").read_text())
+    except OSError:
+        rows = []
+    rows = [r for r in rows if (dst / r["name"]).exists()]
+    hits = lib.search(rows, query, 50) if query.strip() else lib.recent(rows, 12)
+    out["query"] = query
+    out["indexed"] = len(rows)
+    out["items"] = [dict(r, path=str(dst / r["name"])) for r in hits]
+    return out
+
+
+def process():
+    r = subprocess.run([str(ROOT / "snapdex")], capture_output=True, text=True,
+                       timeout=1800, env=dict(_env(), PATH=_env()["PATH"]))
+    out = status()
+    out["ok"] = r.returncode == 0
+    out["log"] = (r.stdout + r.stderr)[-600:]
+    if r.returncode != 0:
+        out["error"] = (r.stderr.strip().splitlines() or ["snapdex failed"])[-1]
+    return out
+
+
+def auto(mode):
+    script = ROOT / "bin" / ("snapdex-install" if mode == "on" else "snapdex-uninstall")
+    r = subprocess.run([str(script)], capture_output=True, text=True, timeout=30, env=_env())
+    out = status()
+    if r.returncode != 0:
+        out["ok"] = False
+        out["error"] = (r.stderr.strip().splitlines() or ["failed"])[-1]
+    return out
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    try:
+        if cmd == "status":
+            res = status()
+        elif cmd == "panel":
+            res = panel(" ".join(argv[2:]))
+        elif cmd == "process":
+            res = process()
+        elif cmd == "auto" and len(argv) > 2 and argv[2] in ("on", "off"):
+            res = auto(argv[2])
+        else:
+            res = {"ok": False, "error": "usage: snapdex-ctl status|panel [q]|process|auto on|off"}
+    except Exception as e:  # always emit JSON for the panel
+        res = {"ok": False, "error": str(e)}
+    print(json.dumps(res))
+    return 0 if res.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

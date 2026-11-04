@@ -1,26 +1,36 @@
 #!/usr/bin/env python3
 """
-Organize ~/Pictures/screenshot-*.png into an indexed folder.
+Organize screenshot-*.png captures into an indexed folder.
 Captions each shot with an OpenRouter vision model (default gemma-4-31b-it),
 one image per request, renames it, then rebuilds index.md.
+
+  snapdex            process everything pending (manual run)
+  snapdex --auto     what the systemd path unit runs: debounced, capped,
+                     only shots taken after auto-processing was enabled,
+                     leaves a shot untouched when captioning fails
+  snapdex --dry-run  list what would be processed, no network, no moves
 """
+import argparse
 import base64
+import fcntl
 import json
 import os
-import re
 import shutil
+import subprocess
 import sys
 import time
+from io import BytesIO
 from pathlib import Path
-from PIL import Image
-import requests
 
-# Own config first; dayflow's config is kept as a legacy fallback so installs
-# that only ever configured dayflow keep working unchanged.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "bin"))
+import snapdexlib as lib  # noqa: E402
+
 CONFIG = Path.home() / ".config" / "snapdex" / "config.json"
 LEGACY_CONFIG = Path.home() / ".config" / "dayflow" / "config.json"
-SRC_DIR = Path.home() / "Pictures"
-DST_DIR = Path.home() / "Pictures" / "Screenshots"
+STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "snapdex"
+DEFAULT_MODEL = "google/gemma-4-31b-it"
+AUTO_MAX = 10
+AUTO_MIN_AGE = 3.0
 PROMPT = (
     "Describe the main content of this screenshot in 3-6 words. "
     "Focus on the app or activity shown. Reply with ONLY the caption in "
@@ -29,40 +39,47 @@ PROMPT = (
 )
 
 
-def load_config():
+def _omaseal_key(ref):
+    """ref = 'service/account'. Last-resort lookup, never printed."""
+    try:
+        service, account = ref.split("/", 1)
+        r = subprocess.run(["omaseal", "get", service, account],
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def load_config(required=True):
     cfg = {}
     for path in (LEGACY_CONFIG, CONFIG):  # later wins: own config overrides
         if path.exists():
             cfg.update(json.loads(path.read_text()))
-    if not cfg:
-        raise SystemExit(
-            "No config found at %s (or legacy %s)" % (CONFIG, LEGACY_CONFIG))
+    # key order: config file, OPENROUTER_API_KEY, omaseal (config "omaseal":
+    # "service/account")
     key = cfg.get("openrouter_api_key") or os.environ.get("OPENROUTER_API_KEY")
+    if not key and cfg.get("omaseal"):
+        key = _omaseal_key(cfg["omaseal"])
     if not key:
-        raise SystemExit("No OpenRouter API key found")
-    return key, cfg.get("model", "google/gemma-4-31b-it")
+        if required:
+            raise SystemExit("No OpenRouter API key found (config, "
+                             "OPENROUTER_API_KEY or config \"omaseal\")")
+        return None, cfg.get("model", DEFAULT_MODEL)
+    return key, cfg.get("model", DEFAULT_MODEL)
 
 
 def resize_to_base64(path, max_dim=640, quality=80):
-    im = Image.open(path)
-    im = im.convert("RGB")
+    from PIL import Image
+    im = Image.open(path).convert("RGB")
     if max(im.size) > max_dim:
         im.thumbnail((max_dim, max_dim))
-    from io import BytesIO
     out = BytesIO()
     im.save(out, format="JPEG", quality=quality)
     return base64.b64encode(out.getvalue()).decode("ascii")
 
 
-def sanitize(caption):
-    c = str(caption if caption is not None else "screenshot").strip().lower()
-    c = re.sub(r"[^a-z0-9_-]+", "_", c)
-    c = re.sub(r"_+", "_", c).strip("_")
-    c = c[:40]
-    return c or "screenshot"
-
-
-def caption_one(api_key, model, path, attempts=3):
+def caption_one(api_key, model, path, attempts=3, strict=False):
+    import requests
     b64 = resize_to_base64(path)
     for attempt in range(attempts):
         try:
@@ -91,57 +108,92 @@ def caption_one(api_key, model, path, attempts=3):
             )
             r.raise_for_status()
             text = r.json()["choices"][0]["message"]["content"]
-            cap = sanitize(text)
+            cap = lib.sanitize(text)
             if cap not in ("screenshot",) and not cap.isdigit():
                 return cap
         except Exception as e:
             print(f"  attempt {attempt + 1} failed for {path.name}: {e}",
                   file=sys.stderr)
         time.sleep(1 + attempt)
-    return "screenshot"
+    return None if strict else "screenshot"
 
 
-def rebuild_index():
-    index_md = DST_DIR / "index.md"
-    lines = ["# Screenshots", ""]
-    for f in sorted(DST_DIR.glob("*.png")):
-        cap = f.stem
-        m = re.match(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_(.+)", f.stem)
-        if m:
-            cap = m.group(1)
-        lines.append(f"- [{f.name}]({f.name}) — {cap.replace('_', ' ')}")
-    index_md.write_text("\n".join(lines) + "\n")
-    return index_md
+def read_auto_since():
+    try:
+        return float((STATE / "auto_since").read_text().strip())
+    except (OSError, ValueError):
+        return None
 
 
-def main():
-    api_key, model = load_config()
-    files = sorted(SRC_DIR.glob("screenshot-*.png"))
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="snapdex")
+    ap.add_argument("--auto", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--max", type=int, default=None, help="cap images this run")
+    args = ap.parse_args(argv)
+
+    sources, dst_dir = lib.screenshot_dirs()
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock = open(STATE / "run.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("another snapdex run is active")
+        return 0
+
+    if args.auto:
+        since = read_auto_since()
+        if since is None:
+            print("auto-processing not enabled; nothing to do")
+            return 0
+        time.sleep(AUTO_MIN_AGE)  # debounce: let the capture finish writing
+        files = lib.list_pending(sources, min_age=AUTO_MIN_AGE, since=since)
+        files = files[: args.max or AUTO_MAX]
+    else:
+        files = lib.list_pending(sources)
+        if args.max:
+            files = files[: args.max]
+
+    if args.dry_run:
+        for f in files:
+            print(f)
+        print(f"{len(files)} pending")
+        return 0
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
     if not files:
-        print("No screenshot-*.png files found in", SRC_DIR)
-        rebuild_index()
-        return
-    DST_DIR.mkdir(parents=True, exist_ok=True)
+        _, changed = lib.write_index_if_changed(dst_dir)
+        print("Nothing pending." + (" Index refreshed." if changed else ""))
+        return 0
+
+    api_key, model = load_config(required=not args.auto)
+    if not api_key:
+        print("snapdex: no API key; leaving shots untouched", file=sys.stderr)
+        return 0
 
     print(f"Captioning {len(files)} screenshot(s) with {model} "
           f"(one request per image)...")
+    done = fails = 0
     for f in files:
-        caption = caption_one(api_key, model, f)
-        ts = f.stem.replace("screenshot-", "")
-        new_name = f"{ts}_{caption}.png"
-        dst = DST_DIR / new_name
-        n = 2
-        while dst.exists():
-            dst = DST_DIR / f"{ts}_{caption}_{n}.png"
-            n += 1
+        caption = caption_one(api_key, model, f, strict=args.auto)
+        if caption is None:
+            fails += 1
+            if fails >= 3:
+                print("3 failures in a row; stopping", file=sys.stderr)
+                break
+            continue
+        fails = 0
+        ts = lib.parse_raw(f.name)[0]
+        dst = lib.unique_target(dst_dir, ts, caption)
         shutil.move(str(f), str(dst))
+        done += 1
         print(f"  {f.name} -> {dst.name}")
 
-    index_md = rebuild_index()
-    print(f"\nOrganized {len(files)} screenshot(s) into {DST_DIR}")
-    print(f"Index rebuilt at {index_md} "
-          f"({len(list(DST_DIR.glob('*.png')))} total files)")
+    index_md, _ = lib.write_index_if_changed(dst_dir)
+    print(f"\nOrganized {done} screenshot(s) into {dst_dir}")
+    print(f"Index at {index_md}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

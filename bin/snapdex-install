@@ -1,0 +1,43 @@
+#!/bin/sh
+# Install + enable the snapdex path unit (user level, no root).
+# Runs `snapdex --auto` whenever a screenshot folder changes. Only shots taken
+# after this call are auto-processed (old backlog stays for "Process now").
+set -eu
+ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+UNITDIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/snapdex"
+PY=$(command -v python3 || echo /usr/bin/python3)
+
+dirs=$(PYTHONPATH="$ROOT/bin" "$PY" -c '
+import snapdexlib as l
+src, dst = l.screenshot_dirs()
+print("\n".join(str(p) for p in src))')
+
+mkdir -p "$UNITDIR" "$STATE"
+{
+  echo "[Unit]"
+  echo "Description=Watch screenshot folders for snapdex"
+  echo "[Path]"
+  echo "$dirs" | while IFS= read -r d; do echo "PathChanged=$d"; done
+  echo "MakeDirectory=no"
+  echo "Unit=snapdex.service"
+  echo "[Install]"
+  echo "WantedBy=default.target"
+} > "$UNITDIR/snapdex.path"
+
+{
+  echo "[Unit]"
+  echo "Description=Caption and index new screenshots (snapdex)"
+  echo "StartLimitIntervalSec=0"
+  echo "[Service]"
+  echo "Type=oneshot"
+  echo "TimeoutStartSec=10min"
+  echo "Nice=10"
+  [ -n "${OMARCHY_SCREENSHOT_DIR:-}" ] && echo "Environment=OMARCHY_SCREENSHOT_DIR=$OMARCHY_SCREENSHOT_DIR"
+  echo "ExecStart=$PY $ROOT/snapdex --auto"
+} > "$UNITDIR/snapdex.service"
+
+# Only mark "since" on a fresh enable so re-running install is harmless.
+[ -f "$STATE/auto_since" ] || date +%s > "$STATE/auto_since"
+systemctl --user daemon-reload
+systemctl --user enable --now snapdex.path

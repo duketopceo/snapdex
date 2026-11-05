@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.duketopceo.snapdex",
+  "name": "Snapdex",
+  "version": "0.1.0",
+  "author": "duketopceo",
+  "license": "MIT",
+  "description": "Camera bar icon with an unprocessed-screenshots badge and a panel of recent captioned screenshots, caption search, Process now, and an auto-processing toggle.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Snapdex",
+    "description": "Recent screenshots, caption search, process-now and auto-processing toggle",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
